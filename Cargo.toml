@@ -1,0 +1,7 @@
+[workspace]
+members = ["star-aligner", "star-sys"]
+resolver = "2"
+default-members = ["star-aligner", "star-sys"]
+
+[workspace.dependencies]
+star-sys = { path = "star-sys" }
