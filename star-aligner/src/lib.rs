@@ -30,7 +30,7 @@ impl StarOpts {
     pub fn new<P: AsRef<Path>>(genome_dir: P) -> Self {
         Self {
             genome_dir: genome_dir.as_ref().to_path_buf(),
-            num_threads: 1,
+            num_threads: 8,
             sjdb_overhang: 100,
             out_filter_score_min: 0,
         }
@@ -133,6 +133,12 @@ impl StarAligner {
         })
     }
 
+    /// Set the number of threads to use for alignment. Default is 8.
+    pub fn with_num_threads(mut self, n: u16) -> Self {
+        self.opts.num_threads = n;
+        self
+    }
+
     pub fn get_header(&self) -> &Header {
         &self.index.header
     }
@@ -140,7 +146,7 @@ impl StarAligner {
     /// Align a chunk of reads
     pub fn align_reads<'a>(
         &'a self,
-        records: &'a mut [fastq::Record],
+        records: &'a [fastq::Record],
     ) -> impl ParallelIterator<Item = Vec<SamRecord>> + 'a {
         let chunk_size = self.get_chunk_size(records.len());
         self.init_thread_pool().install(|| {
@@ -159,19 +165,19 @@ impl StarAligner {
     /// Align a chunk of read pairs
     pub fn align_read_pairs<'a>(
         &'a self,
-        records: &'a mut [(fastq::Record, fastq::Record)],
+        records: &'a [(fastq::Record, fastq::Record)],
     ) -> impl ParallelIterator<Item = (Vec<SamRecord>, Vec<SamRecord>)> + 'a {
         let chunk_size = self.get_chunk_size(records.len());
         self.init_thread_pool().install(|| {
             records.par_chunks(chunk_size).flat_map(|chunk| {
-                let aligner = self.get_aligner();
+                let mut aligner = self.get_aligner();
                 let mut fq_buf1 = Vec::new();
                 let mut fq_buf2 = Vec::new();
                 let mut sam_buf = Vec::new();
                 chunk
                     .iter()
                     .map(|(fq1, fq2)|
-                        align_read_pair(&aligner, fq1, fq2, &mut fq_buf1, &mut fq_buf2, &mut sam_buf).unwrap()
+                        align_read_pair(&mut aligner, fq1, fq2, &mut fq_buf1, &mut fq_buf2, &mut sam_buf).unwrap()
                     ).collect::<Vec<_>>()
             })
         })
@@ -196,6 +202,8 @@ impl StarAligner {
     }
 }
 
+/// Align a single read. Note that the aligner is mutably borrowed.
+/// We did this on purpose to ensure this function cannot be called concurrently.
 fn align_read(
     aligner: &mut _AlignerWrapper,
     fq: &FastqRecord,
@@ -220,8 +228,10 @@ fn align_read(
     Ok(records)
 }
 
+/// Align a pair of reads. Note that the aligner is mutably borrowed.
+/// We did this on purpose to ensure this function cannot be called concurrently.
 fn align_read_pair(
-    aligner: &_AlignerWrapper,
+    aligner: &mut _AlignerWrapper,
     fq1: &FastqRecord,
     fq2: &FastqRecord,
     fq_buf1: &mut Vec<u8>,
@@ -310,9 +320,10 @@ fn get_lines(path: &Path) -> Vec<String> {
 
 #[cfg(test)]
 mod test {
-    use fastq::record::Definition;
-
     use super::*;
+
+    use flate2::read::GzDecoder;
+    use fastq::record::Definition;
 
     fn make_fq(name: &[u8], seq: &[u8], qual: &[u8]) -> FastqRecord {
         FastqRecord::new(Definition::new(name, ""), seq, qual)
@@ -333,10 +344,7 @@ mod test {
     const ERCC_READ_4: &[u8] = b"AATCCACTCAATAAATCTAAAAAC";
     const ERCC_QUAL_4: &[u8] = b"????????????????????????";
 
-    const ERCC_PE_1_PATH: &str = "/data/wenjie/sim.R1.fq";
-    const ERCC_PE_2_PATH: &str = "/data/wenjie/sim.R2.fq";
-
-    const ERCC_PARA300_PATH: &str = "/data/wenjie/para1k.fq";
+    const ERCC_PARA300_PATH: &str = "test/test_ercc_reads.fastq.gz";
 
     #[test]
     fn test_header() {
@@ -367,7 +375,7 @@ mod test {
         println!("{:?}", recs);
 
         let (recs1, recs2) = align_read_pair(
-            &aligner,
+            &mut aligner,
             &make_fq(b"a", b"A", b"?"),
             &make_fq(b"a", b"C", b"?"),
             &mut fq_buf1,
@@ -448,118 +456,36 @@ mod test {
         println!("{:?}", recs);
     }
 
-    /*
-    #[test]
-    fn test_old_multithreads() {
-        let opts = StarOpts::new(ERCC_REF);
-        let index = StarIndex::load(opts).unwrap();
-        let aligner = index.get_aligner();
-
-        let mut fqrdr = File::open(ERCC_PARA300_PATH)
-            .map(BufReader::new)
-            .map(fastq::io::Reader::new)
-            .unwrap();
-        let mut fqrecs = Vec::new();
-        for fqrec in fqrdr.records() {
-            let fqrec = fqrec.unwrap();
-            fqrecs.push(fqrec);
-        }
-
-        let threads = 64;
-        // set number of threads
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads as usize)
-            .build()
-            .unwrap();
-        // let fqrecs = vec![fake_rec1, fake_rec2, fake_rec3, fake_rec4];
-
-        let cloned_count = Arc::new(Mutex::new(0));
-        let _records: Vec<Vec<SamRecord>> = pool.install(|| {
-            fqrecs
-                .par_iter()
-                .map(|fqrec| {
-                    let mut fq_buf = Vec::new();
-                    let mut aligner = aligner.clone();
-                    let mut count = cloned_count.lock().unwrap();
-                    *count += 1;
-                    aligner.align_read(fqrec, &mut fq_buf).unwrap()
-                })
-                .collect()
-        });
-        println!("cloned_count: {:?}", cloned_count);
-    }
 
     #[test]
     fn test_multithreads_align() {
-        let opts = StarOpts::new(ERCC_REF);
-        let index = StarIndex::load(opts).unwrap();
-        let mut aligner = index.get_aligner();
-
-        let mut fqrdr = File::open(ERCC_PARA300_PATH)
+        let mut fq_reader= File::open(ERCC_PARA300_PATH)
+            .map(GzDecoder::new)
             .map(BufReader::new)
             .map(fastq::io::Reader::new)
             .unwrap();
-        let mut fqrecs = Vec::new();
-        for fqrec in fqrdr.records() {
-            let fqrec = fqrec.unwrap();
-            fqrecs.push(fqrec);
-        }
-        let _res = aligner.align_reads(&mut fqrecs, 64);
-    }
+        let records: Vec<_> = fq_reader.records().map(Result::unwrap).collect();
 
-    #[test]
-    fn test_singlethread_align() {
+        // Single end
         let opts = StarOpts::new(ERCC_REF);
-        let index = StarIndex::load(opts).unwrap();
-        let aligner = index.get_aligner();
+        let aligner = StarAligner::new(opts).unwrap().with_num_threads(1);
+        let res1 = aligner.align_reads(&records).collect::<Vec<_>>();
 
-        let mut fqrdr = File::open(ERCC_PARA300_PATH)
-            .map(BufReader::new)
-            .map(fastq::io::Reader::new)
-            .unwrap();
-        let mut fqrecs = Vec::new();
-        for fqrec in fqrdr.records() {
-            let fqrec = fqrec.unwrap();
-            fqrecs.push(fqrec);
-        }
+        let aligner = aligner.with_num_threads(8);
+        let res2 = aligner.align_reads(&records).collect::<Vec<_>>();
+        assert_eq!(res1, res2);
 
-        let _records: Vec<Vec<SamRecord>> = fqrecs
-            .iter()
-            .map(|fqrec| {
-                let mut fq_buf = Vec::new();
-                let mut aligner = aligner.clone();
-                aligner.align_read(fqrec, &mut fq_buf).unwrap()
-            })
-            .collect();
+        // Paired end
+        let records = records.chunks(2).map(|chunk| {
+            let (r1, r2) = chunk.split_at(1);
+            (r1[0].clone(), r2[0].clone())
+        }).collect::<Vec<_>>();
+
+        let aligner = aligner.with_num_threads(1);
+        let res1 = aligner.align_read_pairs(&records).collect::<Vec<_>>();
+
+        let aligner = aligner.with_num_threads(8);
+        let res2 = aligner.align_read_pairs(&records).collect::<Vec<_>>();
+        assert_eq!(res1, res2);
     }
-
-    // #[test]
-    // fn test_ercc_pefile_align() {
-    //     let opts = StarOpts::new(ERCC_REF);
-    //     let index = StarIndex::load(opts).unwrap();
-    //     let mut aligner = StarAligner::new(index);
-    //     // let header = aligner.index.0.header.clone();
-
-    //     let mut fq1rdr = File::open(ERCC_PE_1_PATH)
-    //         .map(BufReader::new)
-    //         .map(fastq::io::Reader::new)
-    //         .unwrap();
-    //     let mut record1 = FastqRecord::default();
-    //     let _ = fastq::Reader::read_record(&mut fq1rdr, &mut record1);
-    //     println!("rec1:{:?}", record1);
-
-    //     let mut fq2rdr = File::open(ERCC_PE_2_PATH)
-    //         .map(BufReader::new)
-    //         .map(fastq::io::Reader::new)
-    //         .unwrap();
-    //     let mut record2 = FastqRecord::default();
-    //     let _ = fastq::Reader::read_record(&mut fq2rdr, &mut record2);
-    //     println!("rec2:{:?}", record2);
-
-    //     let (pair_res1, pair_res2) = aligner.align_read_pair((&record1, &record2)).unwrap();
-    //     println!("{:?}", pair_res1);
-    //     println!("{:?}", pair_res2);
-    // }
-
-    */
 }

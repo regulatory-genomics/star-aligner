@@ -12,5 +12,8 @@ noodles = { version = "0.80", features = ["core", "fastq", "bam", "sam"] }
 rayon = "1.10.0"
 star-sys = { version = "0.2", workspace = true}
 
+[dev-dependencies]
+flate2 = "1.0"
+
 [profile.release]
 debug = 1
