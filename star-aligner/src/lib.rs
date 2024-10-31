@@ -6,7 +6,6 @@ use noodles::sam::{
 };
 use noodles::{fastq, sam};
 use rayon::prelude::*;
-use std::sync::Mutex;
 use std::{
     // collections::HashMap,
     ffi::{c_char, c_int, CStr, CString},
@@ -196,7 +195,7 @@ impl StarAligner {
         let fqrecs_chunks: Vec<_> = fqrecs.chunks(chunk_size).collect();
 
         // align reads in parallel
-        let cloned_count = Arc::new(Mutex::new(0));
+        // let cloned_count = Arc::new(Mutex::new(0));
         let records: Vec<SamRecord> = pool.install(|| {
             fqrecs_chunks
                 .par_iter()
@@ -205,8 +204,8 @@ impl StarAligner {
                     let mut fq_buf = Vec::new();
                     // clone the aligner in each thread
                     let mut aligner = self.clone();
-                    let mut count = cloned_count.lock().unwrap();
-                    *count += 1;
+                    // let mut count = cloned_count.lock().unwrap();
+                    // *count += 1;
                     chunk
                         .iter()
                         .flat_map(|fqrec| aligner.align_read(fqrec, &mut fq_buf).unwrap())
@@ -214,7 +213,7 @@ impl StarAligner {
                 })
                 .collect()
         });
-        println!("cloned_count: {:?}", cloned_count);
+        // println!("cloned_count: {:?}", cloned_count);
         Ok(records)
     }
 
