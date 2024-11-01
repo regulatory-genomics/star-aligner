@@ -90,9 +90,7 @@ struct _AlignerWrapper(*mut star_sys::Aligner);
 
 impl _AlignerWrapper {
     fn new(index: &StarIndex) -> Self {
-        unsafe {
-            Self(star_sys::init_aligner_from_ref(index.index))
-        }
+        unsafe { Self(star_sys::init_aligner_from_ref(index.index)) }
     }
 }
 
@@ -122,10 +120,7 @@ impl StarAligner {
         let length = c_args.len() as c_int;
 
         let index = unsafe { star_sys::init_star_ref(length, c_args.as_ptr()) };
-        let index = StarIndex {
-            index,
-            header,
-        };
+        let index = StarIndex { index, header };
 
         Ok(Self {
             index: Arc::new(index),
@@ -176,9 +171,18 @@ impl StarAligner {
                 let mut sam_buf = Vec::new();
                 chunk
                     .iter()
-                    .map(|(fq1, fq2)|
-                        align_read_pair(&mut aligner, fq1, fq2, &mut fq_buf1, &mut fq_buf2, &mut sam_buf).unwrap()
-                    ).collect::<Vec<_>>()
+                    .map(|(fq1, fq2)| {
+                        align_read_pair(
+                            &mut aligner,
+                            fq1,
+                            fq2,
+                            &mut fq_buf1,
+                            &mut fq_buf2,
+                            &mut sam_buf,
+                        )
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>()
             })
         })
     }
@@ -322,8 +326,8 @@ fn get_lines(path: &Path) -> Vec<String> {
 mod test {
     use super::*;
 
-    use flate2::read::GzDecoder;
     use fastq::record::Definition;
+    use flate2::read::GzDecoder;
 
     fn make_fq(name: &[u8], seq: &[u8], qual: &[u8]) -> FastqRecord {
         FastqRecord::new(Definition::new(name, ""), seq, qual)
@@ -352,7 +356,7 @@ mod test {
         let aligner = StarAligner::new(opts).unwrap();
 
         let mut writer = sam::io::Writer::new(Vec::new());
-        writer.write_header(&aligner.get_header()).unwrap();
+        writer.write_header(aligner.get_header()).unwrap();
         let header_string = String::from_utf8(writer.get_ref().clone()).unwrap();
         assert!(header_string.starts_with("@SQ\tSN:ERCC-00002\tLN:1061\n"));
         assert!(header_string.ends_with("@SQ\tSN:ERCC-00171\tLN:505\n"));
@@ -371,7 +375,8 @@ mod test {
             &make_fq(b"a", b"b", b"?"),
             &mut fq_buf1,
             &mut sam_buf,
-        ).unwrap();
+        )
+        .unwrap();
         println!("{:?}", recs);
 
         let (recs1, recs2) = align_read_pair(
@@ -381,7 +386,8 @@ mod test {
             &mut fq_buf1,
             &mut fq_buf2,
             &mut sam_buf,
-        ).unwrap();
+        )
+        .unwrap();
         println!("{:?}, {:?}", recs1, recs2);
     }
 
@@ -456,10 +462,9 @@ mod test {
         println!("{:?}", recs);
     }
 
-
     #[test]
     fn test_multithreads_align() {
-        let mut fq_reader= File::open(ERCC_PARA300_PATH)
+        let mut fq_reader = File::open(ERCC_PARA300_PATH)
             .map(GzDecoder::new)
             .map(BufReader::new)
             .map(fastq::io::Reader::new)
@@ -476,10 +481,13 @@ mod test {
         assert_eq!(res1, res2);
 
         // Paired end
-        let records = records.chunks(2).map(|chunk| {
-            let (r1, r2) = chunk.split_at(1);
-            (r1[0].clone(), r2[0].clone())
-        }).collect::<Vec<_>>();
+        let records = records
+            .chunks(2)
+            .map(|chunk| {
+                let (r1, r2) = chunk.split_at(1);
+                (r1[0].clone(), r2[0].clone())
+            })
+            .collect::<Vec<_>>();
 
         let aligner = aligner.with_num_threads(1);
         let res1 = aligner.align_read_pairs(&records).collect::<Vec<_>>();
