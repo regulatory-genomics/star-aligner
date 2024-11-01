@@ -1,10 +1,12 @@
 use anyhow::{bail, Result};
-use noodles::fastq::Record as FastqRecord;
-use noodles::sam::{
-    header::record::value::{map::ReferenceSequence, Map},
-    Header, Record as SamRecord,
+use noodles::{
+    fastq,
+    sam::{
+        self,
+        header::record::value::{map::ReferenceSequence, Map},
+        Header, Record as SamRecord,
+    },
 };
-use noodles::{fastq, sam};
 use rayon::prelude::*;
 use std::{
     ffi::{c_char, c_int, CStr, CString},
@@ -15,7 +17,9 @@ use std::{
     vec,
 };
 
-/// StarOpts contains the parameters which will be used for the STAR aligner.
+/// Struct representing STAR aligner options.
+/// 
+/// `StarOpts` stores settings to control the behavior of the STAR aligner.
 #[derive(Clone)]
 pub struct StarOpts {
     genome_dir: PathBuf, // Path to the STAR reference genome
@@ -27,6 +31,14 @@ pub struct StarOpts {
 }
 
 impl StarOpts {
+    /// Create a new `StarOpts` instance.
+    /// 
+    /// # Arguments
+    /// - `genome_dir` - Path to the STAR genome directory.
+    /// 
+    /// # Returns
+    /// - A `StarOpts` object with default values for threads, splice junction
+    ///   overhang, and minimum filter score.
     pub fn new<P: AsRef<Path>>(genome_dir: P) -> Self {
         Self {
             genome_dir: genome_dir.as_ref().to_path_buf(),
@@ -36,6 +48,10 @@ impl StarOpts {
         }
     }
 
+    /// Converts options to a vector of C-style strings for FFI compatibility.
+    /// 
+    /// # Returns
+    /// - A vector of pointers to C-style strings representing each option.
     fn to_c_args(&self) -> Vec<*const i8> {
         let num_threads = self.num_threads.to_string();
         let sjdb_overhang = self.sjdb_overhang.to_string();
@@ -68,6 +84,9 @@ impl StarOpts {
     }
 }
 
+/// STAR index representation.
+/// 
+/// `StarIndex` stores the reference index and header for STAR alignments.
 struct StarIndex {
     index: *const star_sys::StarRef,
     header: Header,
@@ -81,6 +100,19 @@ impl Drop for StarIndex {
         unsafe {
             star_sys::destroy_ref(self.index);
         }
+    }
+}
+
+impl StarIndex {
+    /// Load a reference index into memory based on the given settings.
+    fn load(opts: &StarOpts) -> Result<Self> {
+        let header = generate_header(opts.genome_dir.as_path())?;
+
+        let c_args = opts.to_c_args();
+        let length = c_args.len() as c_int;
+
+        let index = unsafe { star_sys::init_star_ref(length, c_args.as_ptr()) };
+        Ok(StarIndex { index, header })
     }
 }
 
@@ -100,20 +132,24 @@ impl Drop for _AlignerWrapper {
     }
 }
 
+/// Main interface for performing read alignments using STAR.
+/// 
+/// `StarAligner` handles alignment of both single and paired-end reads to a reference genome.
 pub struct StarAligner {
     index: Arc<StarIndex>,
     opts: StarOpts,
 }
 
-/// StarAligner aligns single reads or read-pairs to the reference it is initialized with, and returns
-/// rust_htslib Record objects
 impl StarAligner {
-    /// Load the reference index into memory based on the given settings.
-    /// Should only be called once for a given reference. Create aligners
-    /// that use this reference by calling `get_aligner`.  The reference
-    /// index will be free'd when all `Aligner`s that use this `StarReference`
-    /// have been dropped.
+    /// Loads the genome index into memory.
+    /// 
+    /// # Arguments
+    /// - `opts` - Options controlling alignment parameters.
+    /// 
+    /// # Returns
+    /// - A `StarAligner` object initialized with the provided options.
     pub fn new(opts: StarOpts) -> Result<Self> {
+<<<<<<< HEAD
         let header = generate_header(opts.genome_dir.as_path())?;
 
         let c_args = opts.to_c_args();
@@ -122,23 +158,42 @@ impl StarAligner {
         let index = unsafe { star_sys::init_star_ref(length, c_args.as_ptr()) };
         let index = StarIndex { index, header };
 
+=======
+        let index = StarIndex::load(&opts)?;
+>>>>>>> f9915ea3afbac1e8f4773e2e7c22376f1549c3c7
         Ok(Self {
             index: Arc::new(index),
             opts,
         })
     }
 
-    /// Set the number of threads to use for alignment. Default is 8.
+    /// Sets the number of threads for alignment.
+    /// 
+    /// # Arguments
+    /// - `n` - Number of threads to use.
+    /// 
+    /// # Returns
+    /// - `Self` with the updated thread count.
     pub fn with_num_threads(mut self, n: u16) -> Self {
         self.opts.num_threads = n;
         self
     }
 
+    /// Retrieves the header information.
+    /// 
+    /// # Returns
+    /// - A reference to the alignment header.
     pub fn get_header(&self) -> &Header {
         &self.index.header
     }
 
-    /// Align a chunk of reads
+    /// Aligns a batch of single-end reads.
+    /// 
+    /// # Arguments
+    /// - `records` - A slice of FASTQ records to align.
+    /// 
+    /// # Returns
+    /// - An iterator over vectors of aligned SAM records.
     pub fn align_reads<'a>(
         &'a self,
         records: &'a [fastq::Record],
@@ -157,7 +212,13 @@ impl StarAligner {
         })
     }
 
-    /// Align a chunk of read pairs
+    /// Aligns a batch of paired-end reads.
+    /// 
+    /// # Arguments
+    /// - `records` - A slice of FASTQ read pairs.
+    /// 
+    /// # Returns
+    /// - An iterator over tuples of aligned SAM records for each mate.
     pub fn align_read_pairs<'a>(
         &'a self,
         records: &'a [(fastq::Record, fastq::Record)],
@@ -210,7 +271,7 @@ impl StarAligner {
 /// We did this on purpose to ensure this function cannot be called concurrently.
 fn align_read(
     aligner: &mut _AlignerWrapper,
-    fq: &FastqRecord,
+    fq: &fastq::Record,
     fq_buf: &mut Vec<u8>,
     sam_buf: &mut Vec<u8>,
 ) -> Result<Vec<SamRecord>> {
@@ -236,8 +297,8 @@ fn align_read(
 /// We did this on purpose to ensure this function cannot be called concurrently.
 fn align_read_pair(
     aligner: &mut _AlignerWrapper,
-    fq1: &FastqRecord,
-    fq2: &FastqRecord,
+    fq1: &fastq::Record,
+    fq2: &fastq::Record,
     fq_buf1: &mut Vec<u8>,
     fq_buf2: &mut Vec<u8>,
     sam_buf: &mut Vec<u8>,
@@ -282,7 +343,7 @@ fn parse_sam_to_records<'a>(
 }
 
 /// Copy a fastq record into a buffer
-fn copy_fq_to_buf(buf: &mut Vec<u8>, fq: &FastqRecord) -> Result<()> {
+fn copy_fq_to_buf(buf: &mut Vec<u8>, fq: &fastq::Record) -> Result<()> {
     buf.clear();
     buf.extend_from_slice(b"@a\n"); // make a fake name to avoid the copy of fq.name
     buf.extend_from_slice(fq.sequence());
@@ -329,8 +390,8 @@ mod test {
     use fastq::record::Definition;
     use flate2::read::GzDecoder;
 
-    fn make_fq(name: &[u8], seq: &[u8], qual: &[u8]) -> FastqRecord {
-        FastqRecord::new(Definition::new(name, ""), seq, qual)
+    fn make_fq(name: &[u8], seq: &[u8], qual: &[u8]) -> fastq::Record {
+        fastq::Record::new(Definition::new(name, ""), seq, qual)
     }
 
     const ERCC_REF: &str = "test/ercc92-1.2.0/star/";
@@ -397,16 +458,17 @@ mod test {
         let aligner = StarAligner::new(opts).unwrap();
         let header = aligner.get_header().clone();
 
-        let fq1 = make_fq(NAME, ERCC_READ_1, ERCC_QUAL_1);
-        let fq2 = make_fq(NAME, ERCC_READ_2, ERCC_QUAL_2);
-        let fq3 = make_fq(NAME, ERCC_READ_3, ERCC_QUAL_3);
-        let fq4 = make_fq(NAME, ERCC_READ_4, ERCC_QUAL_4);
+        let fq1 = make_fq(b"ERCC1", ERCC_READ_1, ERCC_QUAL_1);
+        let fq2 = make_fq(b"ERCC2", ERCC_READ_2, ERCC_QUAL_2);
+        let fq3 = make_fq(b"ERCC3", ERCC_READ_3, ERCC_QUAL_3);
+        let fq4 = make_fq(b"ERCC4", ERCC_READ_4, ERCC_QUAL_4);
 
         let mut fq_buf = Vec::new();
         let mut sam_buf = Vec::new();
 
         let recs = align_read(&mut aligner.get_aligner(), &fq1, &mut fq_buf, &mut sam_buf).unwrap();
         assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].name().unwrap(), "ERCC1");
         assert_eq!(recs[0].alignment_start().unwrap().unwrap().get(), 51);
         assert_eq!(recs[0].reference_sequence_id(&header).unwrap().unwrap(), 0);
         println!("{:?}", recs);
