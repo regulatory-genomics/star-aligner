@@ -18,7 +18,7 @@ use std::{
 };
 
 /// Struct representing STAR aligner options.
-/// 
+///
 /// `StarOpts` stores settings to control the behavior of the STAR aligner.
 #[derive(Clone)]
 pub struct StarOpts {
@@ -32,10 +32,10 @@ pub struct StarOpts {
 
 impl StarOpts {
     /// Create a new `StarOpts` instance.
-    /// 
+    ///
     /// # Arguments
     /// - `genome_dir` - Path to the STAR genome directory.
-    /// 
+    ///
     /// # Returns
     /// - A `StarOpts` object with default values for threads, splice junction
     ///   overhang, and minimum filter score.
@@ -49,7 +49,7 @@ impl StarOpts {
     }
 
     /// Converts options to a vector of C-style strings for FFI compatibility.
-    /// 
+    ///
     /// # Returns
     /// - A vector of pointers to C-style strings representing each option.
     fn to_c_args(&self) -> Vec<*const i8> {
@@ -85,7 +85,7 @@ impl StarOpts {
 }
 
 /// STAR index representation.
-/// 
+///
 /// `StarIndex` stores the reference index and header for STAR alignments.
 struct StarIndex {
     index: *const star_sys::StarRef,
@@ -133,7 +133,7 @@ impl Drop for _AlignerWrapper {
 }
 
 /// Main interface for performing read alignments using STAR.
-/// 
+///
 /// `StarAligner` handles alignment of both single and paired-end reads to a reference genome.
 pub struct StarAligner {
     index: Arc<StarIndex>,
@@ -142,10 +142,10 @@ pub struct StarAligner {
 
 impl StarAligner {
     /// Loads the genome index into memory.
-    /// 
+    ///
     /// # Arguments
     /// - `opts` - Options controlling alignment parameters.
-    /// 
+    ///
     /// # Returns
     /// - A `StarAligner` object initialized with the provided options.
     pub fn new(opts: StarOpts) -> Result<Self> {
@@ -157,10 +157,10 @@ impl StarAligner {
     }
 
     /// Sets the number of threads for alignment.
-    /// 
+    ///
     /// # Arguments
     /// - `n` - Number of threads to use.
-    /// 
+    ///
     /// # Returns
     /// - `Self` with the updated thread count.
     pub fn with_num_threads(mut self, n: u16) -> Self {
@@ -169,7 +169,7 @@ impl StarAligner {
     }
 
     /// Retrieves the header information.
-    /// 
+    ///
     /// # Returns
     /// - A reference to the alignment header.
     pub fn get_header(&self) -> &Header {
@@ -177,10 +177,10 @@ impl StarAligner {
     }
 
     /// Aligns a batch of single-end reads.
-    /// 
+    ///
     /// # Arguments
     /// - `records` - A slice of FASTQ records to align.
-    /// 
+    ///
     /// # Returns
     /// - An iterator over vectors of aligned SAM records.
     pub fn align_reads<'a>(
@@ -202,10 +202,10 @@ impl StarAligner {
     }
 
     /// Aligns a batch of paired-end reads.
-    /// 
+    ///
     /// # Arguments
     /// - `records` - A slice of FASTQ read pairs.
-    /// 
+    ///
     /// # Returns
     /// - An iterator over tuples of aligned SAM records for each mate.
     pub fn align_read_pairs<'a>(
@@ -406,7 +406,7 @@ mod test {
         let aligner = StarAligner::new(opts).unwrap();
 
         let mut writer = sam::io::Writer::new(Vec::new());
-        writer.write_header(&aligner.get_header()).unwrap();
+        writer.write_header(aligner.get_header()).unwrap();
         let header_string = String::from_utf8(writer.get_ref().clone()).unwrap();
         assert!(header_string.starts_with("@SQ\tSN:ERCC-00002\tLN:1061\n"));
         assert!(header_string.ends_with("@SQ\tSN:ERCC-00171\tLN:505\n"));
