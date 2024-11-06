@@ -187,6 +187,29 @@ impl StarAligner {
         &self.index.header
     }
 
+    /// Aligns a batch of reads and applies a function to the resulting SAM records.
+    /// This is useful for cases where you want to process the aligned records in some way.
+    /// For example, you could filter out low-quality alignments or extract specific fields.
+    pub fn align_reads_with<'a, F, T>(
+        &'a self,
+        records: &'a [fastq::Record],
+        f: &'a F,
+    ) -> impl ParallelIterator<Item = T> + 'a
+    where
+        F: Fn(Vec<sam::Record>) -> T + Sync,
+        T: Send,
+    {
+        let chunk_size = self.get_chunk_size(records.len());
+        self.init_thread_pool().install(|| {
+            records.par_chunks(chunk_size).flat_map_iter(move |chunk| {
+                let mut aligner = self.get_aligner();
+                chunk
+                    .iter()
+                    .map(move |fq| f(align_read(&mut aligner, fq).unwrap()))
+            })
+        })
+    }
+
     /// Aligns a batch of single-end reads.
     ///
     /// # Arguments
@@ -200,28 +223,37 @@ impl StarAligner {
     ) -> impl ParallelIterator<Item = Vec<sam::Record>> + 'a {
         let chunk_size = self.get_chunk_size(records.len());
         self.init_thread_pool().install(|| {
-            records.par_chunks(chunk_size).flat_map(|chunk| {
+            records.par_chunks(chunk_size).flat_map_iter(|chunk| {
                 let mut aligner = self.get_aligner();
                 chunk
                     .iter()
-                    .map(|fq| align_read(&mut aligner, fq).unwrap())
-                    .collect::<Vec<_>>()
+                    .map(move |fq| align_read(&mut aligner, fq).unwrap())
             })
         })
     }
 
-    /*
-    pub fn align_reads_with<'a, F, T>(
+    pub fn align_read_pairs_with<'a, F, T>(
         &'a self,
-        records: &'a [fastq::Record],
-        f: F,
-    ) -> impl ParallelIterator<Item = Vec<T>> + 'a
+        records: &'a [(fastq::Record, fastq::Record)],
+        f: &'a F,
+    ) -> impl ParallelIterator<Item = (T, T)> + 'a
     where
-        F: Fn(sam::Record) -> T + Sync + Send + 'a,
+        F: Fn(Vec<sam::Record>) -> T + Sync,
+        T: Send,
     {
-        todo!()
+        let chunk_size = self.get_chunk_size(records.len());
+        self.init_thread_pool().install(|| {
+            records.par_chunks(chunk_size).flat_map_iter(move |chunk| {
+                let mut aligner = self.get_aligner();
+                chunk
+                    .iter()
+                    .map(move |(fq1, fq2)| {
+                        let (r1, r2) = align_read_pair(&mut aligner, fq1, fq2).unwrap();
+                        (f(r1), f(r2))
+                    })
+            })
+        })
     }
-    */
 
     /// Aligns a batch of paired-end reads.
     ///
@@ -236,12 +268,11 @@ impl StarAligner {
     ) -> impl ParallelIterator<Item = (Vec<sam::Record>, Vec<sam::Record>)> + 'a {
         let chunk_size = self.get_chunk_size(records.len());
         self.init_thread_pool().install(|| {
-            records.par_chunks(chunk_size).flat_map(|chunk| {
+            records.par_chunks(chunk_size).flat_map_iter(|chunk| {
                 let mut aligner = self.get_aligner();
                 chunk
                     .iter()
-                    .map(|(fq1, fq2)| align_read_pair(&mut aligner, fq1, fq2).unwrap())
-                    .collect::<Vec<_>>()
+                    .map(move |(fq1, fq2)| align_read_pair(&mut aligner, fq1, fq2).unwrap())
             })
         })
     }
@@ -517,9 +548,17 @@ mod test {
         let opts = StarOpts::new(ERCC_REF);
         let aligner = StarAligner::new(opts).unwrap().with_num_threads(1);
         let res1 = aligner.align_reads(&records).collect::<Vec<_>>();
+        assert_eq!(
+            aligner.align_reads_with(&records, &|x| x.len()).collect::<Vec<_>>(),
+            res1.iter().map(|x| x.len()).collect::<Vec<_>>(),
+        );
 
         let aligner = aligner.with_num_threads(8);
         let res2 = aligner.align_reads(&records).collect::<Vec<_>>();
+        assert_eq!(
+            aligner.align_reads_with(&records, &|x| x.len()).collect::<Vec<_>>(),
+            res2.iter().map(|x| x.len()).collect::<Vec<_>>(),
+        );
         assert_eq!(res1, res2);
 
         // Paired end
@@ -533,9 +572,17 @@ mod test {
 
         let aligner = aligner.with_num_threads(1);
         let res1 = aligner.align_read_pairs(&records).collect::<Vec<_>>();
+        assert_eq!(
+            aligner.align_read_pairs_with(&records, &|x| x.len()).collect::<Vec<_>>(),
+            res1.iter().map(|(x, y)| (x.len(), y.len())).collect::<Vec<_>>(),
+        );
 
         let aligner = aligner.with_num_threads(8);
         let res2 = aligner.align_read_pairs(&records).collect::<Vec<_>>();
+        assert_eq!(
+            aligner.align_read_pairs_with(&records, &|x| x.len()).collect::<Vec<_>>(),
+            res2.iter().map(|(x, y)| (x.len(), y.len())).collect::<Vec<_>>(),
+        );
         assert_eq!(res1, res2);
     }
 }
