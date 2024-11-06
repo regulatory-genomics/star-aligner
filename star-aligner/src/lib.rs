@@ -118,14 +118,14 @@ impl StarIndex {
 
 /// A wrapper around the STAR aligner. This is solely used to ensure that the
 /// aligner is properly deallocated when it goes out of scope.
-struct _AlignerWrapper {
+pub struct InnerAligner {
     inner: *mut star_sys::Aligner,
     sam_buf: Vec<u8>,
     fq1_buf: Vec<u8>,
     fq2_buf: Vec<u8>,
 }
 
-impl _AlignerWrapper {
+impl InnerAligner {
     fn new(index: &StarIndex) -> Self {
         let inner = unsafe { star_sys::init_aligner_from_ref(index.index) };
         Self {
@@ -135,9 +135,66 @@ impl _AlignerWrapper {
             fq2_buf: Vec::new(),
         }
     }
+
+    /// Align a single read. Note that the aligner is mutably borrowed.
+    /// We did this on purpose to ensure this function cannot be called concurrently.
+    pub fn align_read(&mut self, fq: &fastq::Record) -> Result<Vec<sam::Record>> {
+        let fq_buf = &mut self.fq1_buf;
+        let sam_buf = &mut self.sam_buf;
+
+        // Copy the fastq record into a buffer
+        copy_fq_to_buf(fq_buf, fq)?;
+
+        let fq_cstr = CStr::from_bytes_with_nul(fq_buf)?;
+        let res: *const c_char = unsafe { star_sys::align_read(self.inner, fq_cstr.as_ptr()) };
+        if res.is_null() {
+            bail!("STAR returned null alignment");
+        }
+
+        let aln_buf = unsafe { CStr::from_ptr(res) }.to_bytes();
+        let records: Vec<_> = parse_sam_to_records(aln_buf, sam_buf, fq.name()).collect();
+
+        unsafe {
+            libc::free(res as *mut libc::c_void);
+        }
+        Ok(records)
+    }
+
+    /// Align a pair of reads. Note that the aligner is mutably borrowed.
+    /// We did this on purpose to ensure this function cannot be called concurrently.
+    pub fn align_read_pair(
+        &mut self,
+        fq1: &fastq::Record,
+        fq2: &fastq::Record,
+    ) -> Result<(Vec<sam::Record>, Vec<sam::Record>)> {
+        let fq_buf1 = &mut self.fq1_buf;
+        let fq_buf2 = &mut self.fq2_buf;
+        let sam_buf = &mut self.sam_buf;
+
+        // Copy the fastq records into buffers
+        copy_fq_to_buf(fq_buf1, fq1)?;
+        copy_fq_to_buf(fq_buf2, fq2)?;
+        let fq1_str = CStr::from_bytes_with_nul(fq_buf1)?;
+        let fq2_str = CStr::from_bytes_with_nul(fq_buf2)?;
+
+        let res: *const c_char =
+            unsafe { star_sys::align_read_pair(self.inner, fq1_str.as_ptr(), fq2_str.as_ptr()) };
+        if res.is_null() {
+            bail!("STAR returned null alignment");
+        }
+
+        let aln_buf = unsafe { CStr::from_ptr(res) }.to_bytes();
+        let (first_mate, second_mate) = parse_sam_to_records(aln_buf, sam_buf, fq1.name())
+            .partition(|rec| rec.flags().unwrap().is_first_segment());
+
+        unsafe {
+            libc::free(res as *mut libc::c_void);
+        }
+        Ok((first_mate, second_mate))
+    }
 }
 
-impl Drop for _AlignerWrapper {
+impl Drop for InnerAligner {
     fn drop(&mut self) {
         unsafe { star_sys::destroy_aligner(self.inner) };
     }
@@ -187,29 +244,6 @@ impl StarAligner {
         &self.index.header
     }
 
-    /// Aligns a batch of reads and applies a function to the resulting SAM records.
-    /// This is useful for cases where you want to process the aligned records in some way.
-    /// For example, you could filter out low-quality alignments or extract specific fields.
-    pub fn align_reads_with<'a, F, T>(
-        &'a self,
-        records: &'a [fastq::Record],
-        f: &'a F,
-    ) -> impl ParallelIterator<Item = T> + 'a
-    where
-        F: Fn(Vec<sam::Record>) -> T + Sync,
-        T: Send,
-    {
-        let chunk_size = self.get_chunk_size(records.len());
-        self.init_thread_pool().install(|| {
-            records.par_chunks(chunk_size).flat_map_iter(move |chunk| {
-                let mut aligner = self.get_aligner();
-                chunk
-                    .iter()
-                    .map(move |fq| f(align_read(&mut aligner, fq).unwrap()))
-            })
-        })
-    }
-
     /// Aligns a batch of single-end reads.
     ///
     /// # Arguments
@@ -224,33 +258,10 @@ impl StarAligner {
         let chunk_size = self.get_chunk_size(records.len());
         self.init_thread_pool().install(|| {
             records.par_chunks(chunk_size).flat_map_iter(|chunk| {
-                let mut aligner = self.get_aligner();
+                let mut aligner = self.clone_inner_aligner();
                 chunk
                     .iter()
-                    .map(move |fq| align_read(&mut aligner, fq).unwrap())
-            })
-        })
-    }
-
-    pub fn align_read_pairs_with<'a, F, T>(
-        &'a self,
-        records: &'a [(fastq::Record, fastq::Record)],
-        f: &'a F,
-    ) -> impl ParallelIterator<Item = (T, T)> + 'a
-    where
-        F: Fn(Vec<sam::Record>) -> T + Sync,
-        T: Send,
-    {
-        let chunk_size = self.get_chunk_size(records.len());
-        self.init_thread_pool().install(|| {
-            records.par_chunks(chunk_size).flat_map_iter(move |chunk| {
-                let mut aligner = self.get_aligner();
-                chunk
-                    .iter()
-                    .map(move |(fq1, fq2)| {
-                        let (r1, r2) = align_read_pair(&mut aligner, fq1, fq2).unwrap();
-                        (f(r1), f(r2))
-                    })
+                    .map(move |fq| aligner.align_read(fq).unwrap())
             })
         })
     }
@@ -269,10 +280,10 @@ impl StarAligner {
         let chunk_size = self.get_chunk_size(records.len());
         self.init_thread_pool().install(|| {
             records.par_chunks(chunk_size).flat_map_iter(|chunk| {
-                let mut aligner = self.get_aligner();
+                let mut aligner = self.clone_inner_aligner();
                 chunk
                     .iter()
-                    .map(move |(fq1, fq2)| align_read_pair(&mut aligner, fq1, fq2).unwrap())
+                    .map(move |(fq1, fq2)| aligner.align_read_pair(fq1, fq2).unwrap())
             })
         })
     }
@@ -280,8 +291,8 @@ impl StarAligner {
     /// This will return a copy of the aligner with the same reference index.
     /// Returning a new aligner is necessary for multithreaded alignment, as the
     /// underlying foreign aligner is not thread-safe.
-    fn get_aligner(&self) -> _AlignerWrapper {
-        _AlignerWrapper::new(self.index.as_ref())
+    pub fn clone_inner_aligner(&self) -> InnerAligner {
+        InnerAligner::new(self.index.as_ref())
     }
 
     fn init_thread_pool(&self) -> rayon::ThreadPool {
@@ -294,63 +305,6 @@ impl StarAligner {
     fn get_chunk_size(&self, n_records: usize) -> usize {
         (n_records + self.opts.num_threads as usize - 1) / self.opts.num_threads as usize
     }
-}
-
-/// Align a single read. Note that the aligner is mutably borrowed.
-/// We did this on purpose to ensure this function cannot be called concurrently.
-fn align_read(aligner: &mut _AlignerWrapper, fq: &fastq::Record) -> Result<Vec<sam::Record>> {
-    let fq_buf = &mut aligner.fq1_buf;
-    let sam_buf = &mut aligner.sam_buf;
-
-    // Copy the fastq record into a buffer
-    copy_fq_to_buf(fq_buf, fq)?;
-
-    let fq_cstr = CStr::from_bytes_with_nul(fq_buf)?;
-    let res: *const c_char = unsafe { star_sys::align_read(aligner.inner, fq_cstr.as_ptr()) };
-    if res.is_null() {
-        bail!("STAR returned null alignment");
-    }
-
-    let aln_buf = unsafe { CStr::from_ptr(res) }.to_bytes();
-    let records: Vec<_> = parse_sam_to_records(aln_buf, sam_buf, fq.name()).collect();
-
-    unsafe {
-        libc::free(res as *mut libc::c_void);
-    }
-    Ok(records)
-}
-
-/// Align a pair of reads. Note that the aligner is mutably borrowed.
-/// We did this on purpose to ensure this function cannot be called concurrently.
-fn align_read_pair(
-    aligner: &mut _AlignerWrapper,
-    fq1: &fastq::Record,
-    fq2: &fastq::Record,
-) -> Result<(Vec<sam::Record>, Vec<sam::Record>)> {
-    let fq_buf1 = &mut aligner.fq1_buf;
-    let fq_buf2 = &mut aligner.fq2_buf;
-    let sam_buf = &mut aligner.sam_buf;
-
-    // Copy the fastq records into buffers
-    copy_fq_to_buf(fq_buf1, fq1)?;
-    copy_fq_to_buf(fq_buf2, fq2)?;
-    let fq1_str = CStr::from_bytes_with_nul(fq_buf1)?;
-    let fq2_str = CStr::from_bytes_with_nul(fq_buf2)?;
-
-    let res: *const c_char =
-        unsafe { star_sys::align_read_pair(aligner.inner, fq1_str.as_ptr(), fq2_str.as_ptr()) };
-    if res.is_null() {
-        bail!("STAR returned null alignment");
-    }
-
-    let aln_buf = unsafe { CStr::from_ptr(res) }.to_bytes();
-    let (first_mate, second_mate) = parse_sam_to_records(aln_buf, sam_buf, fq1.name())
-        .partition(|rec| rec.flags().unwrap().is_first_segment());
-
-    unsafe {
-        libc::free(res as *mut libc::c_void);
-    }
-    Ok((first_mate, second_mate))
 }
 
 fn parse_sam_to_records<'a>(
@@ -454,13 +408,12 @@ mod test {
     #[test]
     fn test_empty_tiny_reads() {
         let opts = StarOpts::new(ERCC_REF);
-        let mut aligner = StarAligner::new(opts).unwrap().get_aligner();
+        let mut aligner = StarAligner::new(opts).unwrap().clone_inner_aligner();
 
-        let recs = align_read(&mut aligner, &make_fq(b"a", b"b", b"?")).unwrap();
+        let recs = aligner.align_read(&make_fq(b"a", b"b", b"?")).unwrap();
         println!("{:?}", recs);
 
-        let (recs1, recs2) = align_read_pair(
-            &mut aligner,
+        let (recs1, recs2) = aligner.align_read_pair(
             &make_fq(b"a", b"A", b"?"),
             &make_fq(b"a", b"C", b"?"),
         )
@@ -479,20 +432,20 @@ mod test {
         let fq3 = make_fq(b"ERCC3", ERCC_READ_3, ERCC_QUAL_3);
         let fq4 = make_fq(b"ERCC4", ERCC_READ_4, ERCC_QUAL_4);
 
-        let recs = align_read(&mut aligner.get_aligner(), &fq1).unwrap();
+        let recs = aligner.clone_inner_aligner().align_read(&fq1).unwrap();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].name().unwrap(), "ERCC1");
         assert_eq!(recs[0].alignment_start().unwrap().unwrap().get(), 51);
         assert_eq!(recs[0].reference_sequence_id(&header).unwrap().unwrap(), 0);
         println!("{:?}", recs);
 
-        let recs = align_read(&mut aligner.get_aligner(), &fq2).unwrap();
+        let recs = aligner.clone_inner_aligner().align_read(&fq2).unwrap();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].reference_sequence_id(&header).unwrap().unwrap(), 0);
         assert_eq!(recs[0].alignment_start().unwrap().unwrap().get(), 501);
         println!("{:?}", recs);
 
-        let recs = align_read(&mut aligner.get_aligner(), &fq3).unwrap();
+        let recs = aligner.clone_inner_aligner().align_read(&fq3).unwrap();
         assert_eq!(recs.len(), 2);
         assert_eq!(recs[0].flags().unwrap().bits(), 0);
         assert_eq!(recs[0].reference_sequence_id(&header).unwrap().unwrap(), 39);
@@ -504,7 +457,7 @@ mod test {
         assert_eq!(recs[1].mapping_quality().unwrap().unwrap().get(), 3);
         println!("{:?}", recs);
 
-        let recs = align_read(&mut aligner.get_aligner(), &fq4).unwrap();
+        let recs = aligner.clone_inner_aligner().align_read(&fq4).unwrap();
         println!("{:?}", recs);
         assert_eq!(recs.len(), 2);
         assert_eq!(recs[0].flags().unwrap().bits(), 0);
@@ -526,7 +479,7 @@ mod test {
 
         let fq = make_fq(NAME, ERCC_READ_3, ERCC_QUAL_3);
 
-        let recs = align_read(&mut aligner.get_aligner(), &fq).unwrap();
+        let recs = aligner.clone_inner_aligner().align_read(&fq).unwrap();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].flags().unwrap().bits(), 4); // UNMAP
         assert!(recs[0].reference_sequence_id(&header).is_none());
@@ -548,17 +501,9 @@ mod test {
         let opts = StarOpts::new(ERCC_REF);
         let aligner = StarAligner::new(opts).unwrap().with_num_threads(1);
         let res1 = aligner.align_reads(&records).collect::<Vec<_>>();
-        assert_eq!(
-            aligner.align_reads_with(&records, &|x| x.len()).collect::<Vec<_>>(),
-            res1.iter().map(|x| x.len()).collect::<Vec<_>>(),
-        );
 
         let aligner = aligner.with_num_threads(8);
         let res2 = aligner.align_reads(&records).collect::<Vec<_>>();
-        assert_eq!(
-            aligner.align_reads_with(&records, &|x| x.len()).collect::<Vec<_>>(),
-            res2.iter().map(|x| x.len()).collect::<Vec<_>>(),
-        );
         assert_eq!(res1, res2);
 
         // Paired end
@@ -572,17 +517,9 @@ mod test {
 
         let aligner = aligner.with_num_threads(1);
         let res1 = aligner.align_read_pairs(&records).collect::<Vec<_>>();
-        assert_eq!(
-            aligner.align_read_pairs_with(&records, &|x| x.len()).collect::<Vec<_>>(),
-            res1.iter().map(|(x, y)| (x.len(), y.len())).collect::<Vec<_>>(),
-        );
 
         let aligner = aligner.with_num_threads(8);
         let res2 = aligner.align_read_pairs(&records).collect::<Vec<_>>();
-        assert_eq!(
-            aligner.align_read_pairs_with(&records, &|x| x.len()).collect::<Vec<_>>(),
-            res2.iter().map(|(x, y)| (x.len(), y.len())).collect::<Vec<_>>(),
-        );
         assert_eq!(res1, res2);
     }
 }
