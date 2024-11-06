@@ -4,7 +4,7 @@ use noodles::{
     sam::{
         self,
         header::record::value::{map::ReferenceSequence, Map},
-        Header, Record as SamRecord,
+        Header,
     },
 };
 use rayon::prelude::*;
@@ -18,7 +18,7 @@ use std::{
 };
 
 /// Struct representing STAR aligner options.
-/// 
+///
 /// `StarOpts` stores settings to control the behavior of the STAR aligner.
 #[derive(Clone)]
 pub struct StarOpts {
@@ -32,10 +32,10 @@ pub struct StarOpts {
 
 impl StarOpts {
     /// Create a new `StarOpts` instance.
-    /// 
+    ///
     /// # Arguments
     /// - `genome_dir` - Path to the STAR genome directory.
-    /// 
+    ///
     /// # Returns
     /// - A `StarOpts` object with default values for threads, splice junction
     ///   overhang, and minimum filter score.
@@ -49,7 +49,7 @@ impl StarOpts {
     }
 
     /// Converts options to a vector of C-style strings for FFI compatibility.
-    /// 
+    ///
     /// # Returns
     /// - A vector of pointers to C-style strings representing each option.
     fn to_c_args(&self) -> Vec<*const i8> {
@@ -85,7 +85,7 @@ impl StarOpts {
 }
 
 /// STAR index representation.
-/// 
+///
 /// `StarIndex` stores the reference index and header for STAR alignments.
 struct StarIndex {
     index: *const star_sys::StarRef,
@@ -118,22 +118,33 @@ impl StarIndex {
 
 /// A wrapper around the STAR aligner. This is solely used to ensure that the
 /// aligner is properly deallocated when it goes out of scope.
-struct _AlignerWrapper(*mut star_sys::Aligner);
+struct _AlignerWrapper {
+    inner: *mut star_sys::Aligner,
+    sam_buf: Vec<u8>,
+    fq1_buf: Vec<u8>,
+    fq2_buf: Vec<u8>,
+}
 
 impl _AlignerWrapper {
     fn new(index: &StarIndex) -> Self {
-        unsafe { Self(star_sys::init_aligner_from_ref(index.index)) }
+        let inner = unsafe { star_sys::init_aligner_from_ref(index.index) };
+        Self {
+            inner,
+            sam_buf: Vec::new(),
+            fq1_buf: Vec::new(),
+            fq2_buf: Vec::new(),
+        }
     }
 }
 
 impl Drop for _AlignerWrapper {
     fn drop(&mut self) {
-        unsafe { star_sys::destroy_aligner(self.0) };
+        unsafe { star_sys::destroy_aligner(self.inner) };
     }
 }
 
 /// Main interface for performing read alignments using STAR.
-/// 
+///
 /// `StarAligner` handles alignment of both single and paired-end reads to a reference genome.
 pub struct StarAligner {
     index: Arc<StarIndex>,
@@ -142,10 +153,10 @@ pub struct StarAligner {
 
 impl StarAligner {
     /// Loads the genome index into memory.
-    /// 
+    ///
     /// # Arguments
     /// - `opts` - Options controlling alignment parameters.
-    /// 
+    ///
     /// # Returns
     /// - A `StarAligner` object initialized with the provided options.
     pub fn new(opts: StarOpts) -> Result<Self> {
@@ -157,10 +168,10 @@ impl StarAligner {
     }
 
     /// Sets the number of threads for alignment.
-    /// 
+    ///
     /// # Arguments
     /// - `n` - Number of threads to use.
-    /// 
+    ///
     /// # Returns
     /// - `Self` with the updated thread count.
     pub fn with_num_threads(mut self, n: u16) -> Self {
@@ -169,7 +180,7 @@ impl StarAligner {
     }
 
     /// Retrieves the header information.
-    /// 
+    ///
     /// # Returns
     /// - A reference to the alignment header.
     pub fn get_header(&self) -> &Header {
@@ -177,61 +188,59 @@ impl StarAligner {
     }
 
     /// Aligns a batch of single-end reads.
-    /// 
+    ///
     /// # Arguments
     /// - `records` - A slice of FASTQ records to align.
-    /// 
+    ///
     /// # Returns
     /// - An iterator over vectors of aligned SAM records.
     pub fn align_reads<'a>(
         &'a self,
         records: &'a [fastq::Record],
-    ) -> impl ParallelIterator<Item = Vec<SamRecord>> + 'a {
+    ) -> impl ParallelIterator<Item = Vec<sam::Record>> + 'a {
         let chunk_size = self.get_chunk_size(records.len());
         self.init_thread_pool().install(|| {
             records.par_chunks(chunk_size).flat_map(|chunk| {
                 let mut aligner = self.get_aligner();
-                let mut fq_buf = Vec::new();
-                let mut sam_buf = Vec::new();
                 chunk
                     .iter()
-                    .map(|fq| align_read(&mut aligner, fq, &mut fq_buf, &mut sam_buf).unwrap())
+                    .map(|fq| align_read(&mut aligner, fq).unwrap())
                     .collect::<Vec<_>>()
             })
         })
     }
 
+    /*
+    pub fn align_reads_with<'a, F, T>(
+        &'a self,
+        records: &'a [fastq::Record],
+        f: F,
+    ) -> impl ParallelIterator<Item = Vec<T>> + 'a
+    where
+        F: Fn(sam::Record) -> T + Sync + Send + 'a,
+    {
+        todo!()
+    }
+    */
+
     /// Aligns a batch of paired-end reads.
-    /// 
+    ///
     /// # Arguments
     /// - `records` - A slice of FASTQ read pairs.
-    /// 
+    ///
     /// # Returns
     /// - An iterator over tuples of aligned SAM records for each mate.
     pub fn align_read_pairs<'a>(
         &'a self,
         records: &'a [(fastq::Record, fastq::Record)],
-    ) -> impl ParallelIterator<Item = (Vec<SamRecord>, Vec<SamRecord>)> + 'a {
+    ) -> impl ParallelIterator<Item = (Vec<sam::Record>, Vec<sam::Record>)> + 'a {
         let chunk_size = self.get_chunk_size(records.len());
         self.init_thread_pool().install(|| {
             records.par_chunks(chunk_size).flat_map(|chunk| {
                 let mut aligner = self.get_aligner();
-                let mut fq_buf1 = Vec::new();
-                let mut fq_buf2 = Vec::new();
-                let mut sam_buf = Vec::new();
                 chunk
                     .iter()
-                    .map(|(fq1, fq2)| {
-                        align_read_pair(
-                            &mut aligner,
-                            fq1,
-                            fq2,
-                            &mut fq_buf1,
-                            &mut fq_buf2,
-                            &mut sam_buf,
-                        )
-                        .unwrap()
-                    })
+                    .map(|(fq1, fq2)| align_read_pair(&mut aligner, fq1, fq2).unwrap())
                     .collect::<Vec<_>>()
             })
         })
@@ -258,17 +267,15 @@ impl StarAligner {
 
 /// Align a single read. Note that the aligner is mutably borrowed.
 /// We did this on purpose to ensure this function cannot be called concurrently.
-fn align_read(
-    aligner: &mut _AlignerWrapper,
-    fq: &fastq::Record,
-    fq_buf: &mut Vec<u8>,
-    sam_buf: &mut Vec<u8>,
-) -> Result<Vec<SamRecord>> {
+fn align_read(aligner: &mut _AlignerWrapper, fq: &fastq::Record) -> Result<Vec<sam::Record>> {
+    let fq_buf = &mut aligner.fq1_buf;
+    let sam_buf = &mut aligner.sam_buf;
+
     // Copy the fastq record into a buffer
     copy_fq_to_buf(fq_buf, fq)?;
 
     let fq_cstr = CStr::from_bytes_with_nul(fq_buf)?;
-    let res: *const c_char = unsafe { star_sys::align_read(aligner.0, fq_cstr.as_ptr()) };
+    let res: *const c_char = unsafe { star_sys::align_read(aligner.inner, fq_cstr.as_ptr()) };
     if res.is_null() {
         bail!("STAR returned null alignment");
     }
@@ -288,10 +295,11 @@ fn align_read_pair(
     aligner: &mut _AlignerWrapper,
     fq1: &fastq::Record,
     fq2: &fastq::Record,
-    fq_buf1: &mut Vec<u8>,
-    fq_buf2: &mut Vec<u8>,
-    sam_buf: &mut Vec<u8>,
-) -> Result<(Vec<SamRecord>, Vec<SamRecord>)> {
+) -> Result<(Vec<sam::Record>, Vec<sam::Record>)> {
+    let fq_buf1 = &mut aligner.fq1_buf;
+    let fq_buf2 = &mut aligner.fq2_buf;
+    let sam_buf = &mut aligner.sam_buf;
+
     // Copy the fastq records into buffers
     copy_fq_to_buf(fq_buf1, fq1)?;
     copy_fq_to_buf(fq_buf2, fq2)?;
@@ -299,7 +307,7 @@ fn align_read_pair(
     let fq2_str = CStr::from_bytes_with_nul(fq_buf2)?;
 
     let res: *const c_char =
-        unsafe { star_sys::align_read_pair(aligner.0, fq1_str.as_ptr(), fq2_str.as_ptr()) };
+        unsafe { star_sys::align_read_pair(aligner.inner, fq1_str.as_ptr(), fq2_str.as_ptr()) };
     if res.is_null() {
         bail!("STAR returned null alignment");
     }
@@ -417,25 +425,13 @@ mod test {
         let opts = StarOpts::new(ERCC_REF);
         let mut aligner = StarAligner::new(opts).unwrap().get_aligner();
 
-        let mut fq_buf1 = Vec::new();
-        let mut fq_buf2 = Vec::new();
-        let mut sam_buf = Vec::new();
-        let recs = align_read(
-            &mut aligner,
-            &make_fq(b"a", b"b", b"?"),
-            &mut fq_buf1,
-            &mut sam_buf,
-        )
-        .unwrap();
+        let recs = align_read(&mut aligner, &make_fq(b"a", b"b", b"?")).unwrap();
         println!("{:?}", recs);
 
         let (recs1, recs2) = align_read_pair(
             &mut aligner,
             &make_fq(b"a", b"A", b"?"),
             &make_fq(b"a", b"C", b"?"),
-            &mut fq_buf1,
-            &mut fq_buf2,
-            &mut sam_buf,
         )
         .unwrap();
         println!("{:?}, {:?}", recs1, recs2);
@@ -452,23 +448,20 @@ mod test {
         let fq3 = make_fq(b"ERCC3", ERCC_READ_3, ERCC_QUAL_3);
         let fq4 = make_fq(b"ERCC4", ERCC_READ_4, ERCC_QUAL_4);
 
-        let mut fq_buf = Vec::new();
-        let mut sam_buf = Vec::new();
-
-        let recs = align_read(&mut aligner.get_aligner(), &fq1, &mut fq_buf, &mut sam_buf).unwrap();
+        let recs = align_read(&mut aligner.get_aligner(), &fq1).unwrap();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].name().unwrap(), "ERCC1");
         assert_eq!(recs[0].alignment_start().unwrap().unwrap().get(), 51);
         assert_eq!(recs[0].reference_sequence_id(&header).unwrap().unwrap(), 0);
         println!("{:?}", recs);
 
-        let recs = align_read(&mut aligner.get_aligner(), &fq2, &mut fq_buf, &mut sam_buf).unwrap();
+        let recs = align_read(&mut aligner.get_aligner(), &fq2).unwrap();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].reference_sequence_id(&header).unwrap().unwrap(), 0);
         assert_eq!(recs[0].alignment_start().unwrap().unwrap().get(), 501);
         println!("{:?}", recs);
 
-        let recs = align_read(&mut aligner.get_aligner(), &fq3, &mut fq_buf, &mut sam_buf).unwrap();
+        let recs = align_read(&mut aligner.get_aligner(), &fq3).unwrap();
         assert_eq!(recs.len(), 2);
         assert_eq!(recs[0].flags().unwrap().bits(), 0);
         assert_eq!(recs[0].reference_sequence_id(&header).unwrap().unwrap(), 39);
@@ -480,7 +473,7 @@ mod test {
         assert_eq!(recs[1].mapping_quality().unwrap().unwrap().get(), 3);
         println!("{:?}", recs);
 
-        let recs = align_read(&mut aligner.get_aligner(), &fq4, &mut fq_buf, &mut sam_buf).unwrap();
+        let recs = align_read(&mut aligner.get_aligner(), &fq4).unwrap();
         println!("{:?}", recs);
         assert_eq!(recs.len(), 2);
         assert_eq!(recs[0].flags().unwrap().bits(), 0);
@@ -501,10 +494,8 @@ mod test {
         let header = aligner.get_header().clone();
 
         let fq = make_fq(NAME, ERCC_READ_3, ERCC_QUAL_3);
-        let mut fq_buf = Vec::new();
-        let mut sam_buf = Vec::new();
 
-        let recs = align_read(&mut aligner.get_aligner(), &fq, &mut fq_buf, &mut sam_buf).unwrap();
+        let recs = align_read(&mut aligner.get_aligner(), &fq).unwrap();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].flags().unwrap().bits(), 4); // UNMAP
         assert!(recs[0].reference_sequence_id(&header).is_none());
