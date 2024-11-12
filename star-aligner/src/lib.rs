@@ -7,7 +7,6 @@ use noodles::{
         Header,
     },
 };
-use rayon::prelude::*;
 use std::{
     ffi::{c_char, c_int, CStr, CString},
     fs::File,
@@ -23,7 +22,6 @@ use std::{
 #[derive(Clone)]
 pub struct StarOpts {
     genome_dir: PathBuf, // Path to the STAR reference genome
-    num_threads: u16,    // Number of threads to use
     sjdb_overhang: u16,  // Overhang for splice junctions
     out_filter_score_min: u16, // Alignment will be output only if its score is higher than or equal to this value.
                                // To output higher quality reads, you can set this value closer to read length.
@@ -42,7 +40,6 @@ impl StarOpts {
     pub fn new<P: AsRef<Path>>(genome_dir: P) -> Self {
         Self {
             genome_dir: genome_dir.as_ref().to_path_buf(),
-            num_threads: 8,
             sjdb_overhang: 100,
             out_filter_score_min: 0,
         }
@@ -53,15 +50,12 @@ impl StarOpts {
     /// # Returns
     /// - A vector of pointers to C-style strings representing each option.
     fn to_c_args(&self) -> Vec<*const i8> {
-        let num_threads = self.num_threads.to_string();
         let sjdb_overhang = self.sjdb_overhang.to_string();
         let out_filter_score_min = self.out_filter_score_min.to_string();
         let args = vec![
             "STAR",
             "--genomeDir",
             self.genome_dir.to_str().unwrap(),
-            "--runThreadN",
-            num_threads.as_str(),
             "--sjdbOverhang",
             sjdb_overhang.as_str(),
             "--outFilterScoreMin",
@@ -118,12 +112,15 @@ impl StarIndex {
 
 /// A wrapper around the STAR aligner. This is solely used to ensure that the
 /// aligner is properly deallocated when it goes out of scope.
-pub struct InnerAligner {
+struct InnerAligner {
     inner: *mut star_sys::Aligner,
     sam_buf: Vec<u8>,
     fq1_buf: Vec<u8>,
     fq2_buf: Vec<u8>,
 }
+
+unsafe impl Send for InnerAligner {}
+unsafe impl Sync for InnerAligner {}
 
 impl InnerAligner {
     fn new(index: &StarIndex) -> Self {
@@ -138,7 +135,7 @@ impl InnerAligner {
 
     /// Align a single read. Note that the aligner is mutably borrowed.
     /// We did this on purpose to ensure this function cannot be called concurrently.
-    pub fn align_read(&mut self, fq: &fastq::Record) -> Result<Vec<sam::Record>> {
+    fn align_read(&mut self, fq: &fastq::Record) -> Result<Vec<sam::Record>> {
         let fq_buf = &mut self.fq1_buf;
         let sam_buf = &mut self.sam_buf;
 
@@ -162,7 +159,7 @@ impl InnerAligner {
 
     /// Align a pair of reads. Note that the aligner is mutably borrowed.
     /// We did this on purpose to ensure this function cannot be called concurrently.
-    pub fn align_read_pair(
+    fn align_read_pair(
         &mut self,
         fq1: &fastq::Record,
         fq2: &fastq::Record,
@@ -206,6 +203,20 @@ impl Drop for InnerAligner {
 pub struct StarAligner {
     index: Arc<StarIndex>,
     opts: StarOpts,
+    inner: InnerAligner,
+}
+
+/// This will return a copy of the aligner with the same reference index.
+/// Returning a new aligner is necessary for multithreaded alignment, as the
+/// underlying foreign aligner is not thread-safe.
+impl Clone for StarAligner {
+    fn clone(&self) -> Self {
+        Self {
+            index: self.index.clone(),
+            opts: self.opts.clone(),
+            inner: InnerAligner::new(self.index.as_ref()),
+        }
+    }
 }
 
 impl StarAligner {
@@ -218,22 +229,12 @@ impl StarAligner {
     /// - A `StarAligner` object initialized with the provided options.
     pub fn new(opts: StarOpts) -> Result<Self> {
         let index = StarIndex::load(&opts)?;
+        let inner = InnerAligner::new(&index);
         Ok(Self {
             index: Arc::new(index),
             opts,
+            inner,
         })
-    }
-
-    /// Sets the number of threads for alignment.
-    ///
-    /// # Arguments
-    /// - `n` - Number of threads to use.
-    ///
-    /// # Returns
-    /// - `Self` with the updated thread count.
-    pub fn with_num_threads(mut self, n: u16) -> Self {
-        self.opts.num_threads = n;
-        self
     }
 
     /// Retrieves the header information.
@@ -244,66 +245,18 @@ impl StarAligner {
         &self.index.header
     }
 
-    /// Aligns a batch of single-end reads.
-    ///
-    /// # Arguments
-    /// - `records` - A slice of FASTQ records to align.
-    ///
-    /// # Returns
-    /// - An iterator over vectors of aligned SAM records.
-    pub fn align_reads<'a>(
-        &'a self,
-        records: &'a [fastq::Record],
-    ) -> impl ParallelIterator<Item = Vec<sam::Record>> + 'a {
-        let chunk_size = self.get_chunk_size(records.len());
-        self.init_thread_pool().install(|| {
-            records.par_chunks(chunk_size).flat_map_iter(|chunk| {
-                let mut aligner = self.clone_inner_aligner();
-                chunk
-                    .iter()
-                    .map(move |fq| aligner.align_read(fq).unwrap())
-            })
-        })
+    /// Aligns single-end reads.
+    pub fn align_read(&mut self, fq: &fastq::Record) -> Result<Vec<sam::Record>> {
+        self.inner.align_read(fq)
     }
 
-    /// Aligns a batch of paired-end reads.
-    ///
-    /// # Arguments
-    /// - `records` - A slice of FASTQ read pairs.
-    ///
-    /// # Returns
-    /// - An iterator over tuples of aligned SAM records for each mate.
-    pub fn align_read_pairs<'a>(
-        &'a self,
-        records: &'a [(fastq::Record, fastq::Record)],
-    ) -> impl ParallelIterator<Item = (Vec<sam::Record>, Vec<sam::Record>)> + 'a {
-        let chunk_size = self.get_chunk_size(records.len());
-        self.init_thread_pool().install(|| {
-            records.par_chunks(chunk_size).flat_map_iter(|chunk| {
-                let mut aligner = self.clone_inner_aligner();
-                chunk
-                    .iter()
-                    .map(move |(fq1, fq2)| aligner.align_read_pair(fq1, fq2).unwrap())
-            })
-        })
-    }
-
-    /// This will return a copy of the aligner with the same reference index.
-    /// Returning a new aligner is necessary for multithreaded alignment, as the
-    /// underlying foreign aligner is not thread-safe.
-    pub fn clone_inner_aligner(&self) -> InnerAligner {
-        InnerAligner::new(self.index.as_ref())
-    }
-
-    fn init_thread_pool(&self) -> rayon::ThreadPool {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(self.opts.num_threads as usize)
-            .build()
-            .unwrap()
-    }
-
-    fn get_chunk_size(&self, n_records: usize) -> usize {
-        (n_records + self.opts.num_threads as usize - 1) / self.opts.num_threads as usize
+    /// Aligns paired-end reads.
+    pub fn align_read_pair(
+        &mut self,
+        fq1: &fastq::Record,
+        fq2: &fastq::Record,
+    ) -> Result<(Vec<sam::Record>, Vec<sam::Record>)> {
+        self.inner.align_read_pair(fq1, fq2)
     }
 }
 
@@ -371,6 +324,7 @@ mod test {
 
     use fastq::record::Definition;
     use flate2::read::GzDecoder;
+    use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
     fn make_fq(name: &[u8], seq: &[u8], qual: &[u8]) -> fastq::Record {
         fastq::Record::new(Definition::new(name, ""), seq, qual)
@@ -408,23 +362,21 @@ mod test {
     #[test]
     fn test_empty_tiny_reads() {
         let opts = StarOpts::new(ERCC_REF);
-        let mut aligner = StarAligner::new(opts).unwrap().clone_inner_aligner();
+        let mut aligner = StarAligner::new(opts).unwrap();
 
         let recs = aligner.align_read(&make_fq(b"a", b"b", b"?")).unwrap();
         println!("{:?}", recs);
 
-        let (recs1, recs2) = aligner.align_read_pair(
-            &make_fq(b"a", b"A", b"?"),
-            &make_fq(b"a", b"C", b"?"),
-        )
-        .unwrap();
+        let (recs1, recs2) = aligner
+            .align_read_pair(&make_fq(b"a", b"A", b"?"), &make_fq(b"a", b"C", b"?"))
+            .unwrap();
         println!("{:?}, {:?}", recs1, recs2);
     }
 
     #[test]
     fn test_ercc_align() {
         let opts = StarOpts::new(ERCC_REF);
-        let aligner = StarAligner::new(opts).unwrap();
+        let mut aligner = StarAligner::new(opts).unwrap();
         let header = aligner.get_header().clone();
 
         let fq1 = make_fq(b"ERCC1", ERCC_READ_1, ERCC_QUAL_1);
@@ -432,20 +384,20 @@ mod test {
         let fq3 = make_fq(b"ERCC3", ERCC_READ_3, ERCC_QUAL_3);
         let fq4 = make_fq(b"ERCC4", ERCC_READ_4, ERCC_QUAL_4);
 
-        let recs = aligner.clone_inner_aligner().align_read(&fq1).unwrap();
+        let recs = aligner.align_read(&fq1).unwrap();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].name().unwrap(), "ERCC1");
         assert_eq!(recs[0].alignment_start().unwrap().unwrap().get(), 51);
         assert_eq!(recs[0].reference_sequence_id(&header).unwrap().unwrap(), 0);
         println!("{:?}", recs);
 
-        let recs = aligner.clone_inner_aligner().align_read(&fq2).unwrap();
+        let recs = aligner.align_read(&fq2).unwrap();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].reference_sequence_id(&header).unwrap().unwrap(), 0);
         assert_eq!(recs[0].alignment_start().unwrap().unwrap().get(), 501);
         println!("{:?}", recs);
 
-        let recs = aligner.clone_inner_aligner().align_read(&fq3).unwrap();
+        let recs = aligner.align_read(&fq3).unwrap();
         assert_eq!(recs.len(), 2);
         assert_eq!(recs[0].flags().unwrap().bits(), 0);
         assert_eq!(recs[0].reference_sequence_id(&header).unwrap().unwrap(), 39);
@@ -457,7 +409,7 @@ mod test {
         assert_eq!(recs[1].mapping_quality().unwrap().unwrap().get(), 3);
         println!("{:?}", recs);
 
-        let recs = aligner.clone_inner_aligner().align_read(&fq4).unwrap();
+        let recs = aligner.align_read(&fq4).unwrap();
         println!("{:?}", recs);
         assert_eq!(recs.len(), 2);
         assert_eq!(recs[0].flags().unwrap().bits(), 0);
@@ -474,12 +426,12 @@ mod test {
     fn test_transcriptome_min_score() {
         let mut opts = StarOpts::new(ERCC_REF);
         opts.out_filter_score_min = 20;
-        let aligner = StarAligner::new(opts).unwrap();
+        let mut aligner = StarAligner::new(opts).unwrap();
         let header = aligner.get_header().clone();
 
         let fq = make_fq(NAME, ERCC_READ_3, ERCC_QUAL_3);
 
-        let recs = aligner.clone_inner_aligner().align_read(&fq).unwrap();
+        let recs = aligner.align_read(&fq).unwrap();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].flags().unwrap().bits(), 4); // UNMAP
         assert!(recs[0].reference_sequence_id(&header).is_none());
@@ -499,11 +451,16 @@ mod test {
 
         // Single end
         let opts = StarOpts::new(ERCC_REF);
-        let aligner = StarAligner::new(opts).unwrap().with_num_threads(1);
-        let res1 = aligner.align_reads(&records).collect::<Vec<_>>();
+        let mut aligner = StarAligner::new(opts).unwrap();
+        let res1 = records
+            .iter()
+            .map(|r| aligner.align_read(r).unwrap())
+            .collect::<Vec<_>>();
 
-        let aligner = aligner.with_num_threads(8);
-        let res2 = aligner.align_reads(&records).collect::<Vec<_>>();
+        let res2 = records
+            .par_iter()
+            .map(|r| aligner.clone().align_read(r).unwrap())
+            .collect::<Vec<_>>();
         assert_eq!(res1, res2);
 
         // Paired end
@@ -515,11 +472,15 @@ mod test {
             })
             .collect::<Vec<_>>();
 
-        let aligner = aligner.with_num_threads(1);
-        let res1 = aligner.align_read_pairs(&records).collect::<Vec<_>>();
+        let res1 = records
+            .iter()
+            .map(|(r1, r2)| aligner.align_read_pair(r1, r2).unwrap())
+            .collect::<Vec<_>>();
 
-        let aligner = aligner.with_num_threads(8);
-        let res2 = aligner.align_read_pairs(&records).collect::<Vec<_>>();
+        let res2 = records
+            .par_iter()
+            .map(|(r1, r2)| aligner.clone().align_read_pair(r1, r2).unwrap())
+            .collect::<Vec<_>>();
         assert_eq!(res1, res2);
     }
 }
