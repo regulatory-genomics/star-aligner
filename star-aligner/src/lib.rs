@@ -2,9 +2,7 @@ use anyhow::{bail, Result};
 use noodles::{
     fastq,
     sam::{
-        self,
-        header::record::value::{map::ReferenceSequence, Map},
-        Header,
+        self, alignment::RecordBuf, header::record::value::{map::ReferenceSequence, Map}, Header
     },
 };
 use std::{
@@ -135,7 +133,7 @@ impl InnerAligner {
 
     /// Align a single read. Note that the aligner is mutably borrowed.
     /// We did this on purpose to ensure this function cannot be called concurrently.
-    fn align_read(&mut self, fq: &fastq::Record) -> Result<Vec<sam::Record>> {
+    fn align_read(&mut self, header: &Header, fq: &fastq::Record) -> Result<Vec<RecordBuf>> {
         let fq_buf = &mut self.fq1_buf;
         let sam_buf = &mut self.sam_buf;
 
@@ -149,7 +147,9 @@ impl InnerAligner {
         }
 
         let aln_buf = unsafe { CStr::from_ptr(res) }.to_bytes();
-        let records: Vec<_> = parse_sam_to_records(aln_buf, sam_buf, fq.name()).collect();
+        let records: Vec<_> = parse_sam_to_records(aln_buf, sam_buf, fq.name())
+            .map(|x| RecordBuf::try_from_alignment_record(header, &x).unwrap())
+            .collect();
 
         unsafe {
             libc::free(res as *mut libc::c_void);
@@ -161,9 +161,10 @@ impl InnerAligner {
     /// We did this on purpose to ensure this function cannot be called concurrently.
     fn align_read_pair(
         &mut self,
+        header: &Header,
         fq1: &fastq::Record,
         fq2: &fastq::Record,
-    ) -> Result<(Vec<sam::Record>, Vec<sam::Record>)> {
+    ) -> Result<(Vec<RecordBuf>, Vec<RecordBuf>)> {
         let fq_buf1 = &mut self.fq1_buf;
         let fq_buf2 = &mut self.fq2_buf;
         let sam_buf = &mut self.sam_buf;
@@ -182,7 +183,8 @@ impl InnerAligner {
 
         let aln_buf = unsafe { CStr::from_ptr(res) }.to_bytes();
         let (first_mate, second_mate) = parse_sam_to_records(aln_buf, sam_buf, fq1.name())
-            .partition(|rec| rec.flags().unwrap().is_first_segment());
+            .map(|x| RecordBuf::try_from_alignment_record(header, &x).unwrap())
+            .partition(|rec| rec.flags().is_first_segment());
 
         unsafe {
             libc::free(res as *mut libc::c_void);
@@ -246,8 +248,8 @@ impl StarAligner {
     }
 
     /// Aligns single-end reads.
-    pub fn align_read(&mut self, fq: &fastq::Record) -> Result<Vec<sam::Record>> {
-        self.inner.align_read(fq)
+    pub fn align_read(&mut self, fq: &fastq::Record) -> Result<Vec<RecordBuf>> {
+        self.inner.align_read(&self.index.header, fq)
     }
 
     /// Aligns paired-end reads.
@@ -255,8 +257,8 @@ impl StarAligner {
         &mut self,
         fq1: &fastq::Record,
         fq2: &fastq::Record,
-    ) -> Result<(Vec<sam::Record>, Vec<sam::Record>)> {
-        self.inner.align_read_pair(fq1, fq2)
+    ) -> Result<(Vec<RecordBuf>, Vec<RecordBuf>)> {
+        self.inner.align_read_pair(&self.index.header, fq1, fq2)
     }
 }
 
@@ -377,7 +379,6 @@ mod test {
     fn test_ercc_align() {
         let opts = StarOpts::new(ERCC_REF);
         let mut aligner = StarAligner::new(opts).unwrap();
-        let header = aligner.get_header().clone();
 
         let fq1 = make_fq(b"ERCC1", ERCC_READ_1, ERCC_QUAL_1);
         let fq2 = make_fq(b"ERCC2", ERCC_READ_2, ERCC_QUAL_2);
@@ -387,39 +388,39 @@ mod test {
         let recs = aligner.align_read(&fq1).unwrap();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].name().unwrap(), "ERCC1");
-        assert_eq!(recs[0].alignment_start().unwrap().unwrap().get(), 51);
-        assert_eq!(recs[0].reference_sequence_id(&header).unwrap().unwrap(), 0);
+        assert_eq!(recs[0].alignment_start().unwrap().get(), 51);
+        assert_eq!(recs[0].reference_sequence_id().unwrap(), 0);
         println!("{:?}", recs);
 
         let recs = aligner.align_read(&fq2).unwrap();
         assert_eq!(recs.len(), 1);
-        assert_eq!(recs[0].reference_sequence_id(&header).unwrap().unwrap(), 0);
-        assert_eq!(recs[0].alignment_start().unwrap().unwrap().get(), 501);
+        assert_eq!(recs[0].reference_sequence_id().unwrap(), 0);
+        assert_eq!(recs[0].alignment_start().unwrap().get(), 501);
         println!("{:?}", recs);
 
         let recs = aligner.align_read(&fq3).unwrap();
         assert_eq!(recs.len(), 2);
-        assert_eq!(recs[0].flags().unwrap().bits(), 0);
-        assert_eq!(recs[0].reference_sequence_id(&header).unwrap().unwrap(), 39);
-        assert_eq!(recs[0].alignment_start().unwrap().unwrap().get(), 28);
-        assert_eq!(recs[0].mapping_quality().unwrap().unwrap().get(), 3);
-        assert_eq!(recs[1].flags().unwrap().bits(), 0x110); // REVERSE,SECONDARY
-        assert_eq!(recs[1].reference_sequence_id(&header).unwrap().unwrap(), 72);
-        assert_eq!(recs[1].alignment_start().unwrap().unwrap().get(), 554);
-        assert_eq!(recs[1].mapping_quality().unwrap().unwrap().get(), 3);
+        assert_eq!(recs[0].flags().bits(), 0);
+        assert_eq!(recs[0].reference_sequence_id().unwrap(), 39);
+        assert_eq!(recs[0].alignment_start().unwrap().get(), 28);
+        assert_eq!(recs[0].mapping_quality().unwrap().get(), 3);
+        assert_eq!(recs[1].flags().bits(), 0x110); // REVERSE,SECONDARY
+        assert_eq!(recs[1].reference_sequence_id().unwrap(), 72);
+        assert_eq!(recs[1].alignment_start().unwrap().get(), 554);
+        assert_eq!(recs[1].mapping_quality().unwrap().get(), 3);
         println!("{:?}", recs);
 
         let recs = aligner.align_read(&fq4).unwrap();
         println!("{:?}", recs);
         assert_eq!(recs.len(), 2);
-        assert_eq!(recs[0].flags().unwrap().bits(), 0);
-        assert_eq!(recs[0].reference_sequence_id(&header).unwrap().unwrap(), 72);
-        assert_eq!(recs[0].alignment_start().unwrap().unwrap().get(), 493);
-        assert_eq!(recs[0].mapping_quality().unwrap().unwrap().get(), 3);
-        assert_eq!(recs[1].flags().unwrap().bits(), 0x100); // SECONDARY
-        assert_eq!(recs[1].reference_sequence_id(&header).unwrap().unwrap(), 72);
-        assert_eq!(recs[1].alignment_start().unwrap().unwrap().get(), 608);
-        assert_eq!(recs[1].mapping_quality().unwrap().unwrap().get(), 3);
+        assert_eq!(recs[0].flags().bits(), 0);
+        assert_eq!(recs[0].reference_sequence_id().unwrap(), 72);
+        assert_eq!(recs[0].alignment_start().unwrap().get(), 493);
+        assert_eq!(recs[0].mapping_quality().unwrap().get(), 3);
+        assert_eq!(recs[1].flags().bits(), 0x100); // SECONDARY
+        assert_eq!(recs[1].reference_sequence_id().unwrap(), 72);
+        assert_eq!(recs[1].alignment_start().unwrap().get(), 608);
+        assert_eq!(recs[1].mapping_quality().unwrap().get(), 3);
     }
 
     #[test]
@@ -427,16 +428,15 @@ mod test {
         let mut opts = StarOpts::new(ERCC_REF);
         opts.out_filter_score_min = 20;
         let mut aligner = StarAligner::new(opts).unwrap();
-        let header = aligner.get_header().clone();
 
         let fq = make_fq(NAME, ERCC_READ_3, ERCC_QUAL_3);
 
         let recs = aligner.align_read(&fq).unwrap();
         assert_eq!(recs.len(), 1);
-        assert_eq!(recs[0].flags().unwrap().bits(), 4); // UNMAP
-        assert!(recs[0].reference_sequence_id(&header).is_none());
+        assert_eq!(recs[0].flags().bits(), 4); // UNMAP
+        assert!(recs[0].reference_sequence_id().is_none());
         assert!(recs[0].alignment_start().is_none());
-        assert_eq!(recs[0].mapping_quality().unwrap().unwrap().get(), 0);
+        assert_eq!(recs[0].mapping_quality().unwrap().get(), 0);
         println!("{:?}", recs);
     }
 
