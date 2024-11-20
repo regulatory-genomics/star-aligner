@@ -1,3 +1,5 @@
+pub mod transcript;
+
 use anyhow::{bail, Result};
 use noodles::{
     fastq,
@@ -13,6 +15,73 @@ use std::{
     sync::Arc,
     vec,
 };
+
+/// Main interface for performing read alignments using STAR.
+///
+/// `StarAligner` handles alignment of both single and paired-end reads to a reference genome.
+pub struct StarAligner {
+    index: Arc<StarIndex>,
+    opts: StarOpts,
+    inner: InnerAligner,
+}
+
+/// This will return a copy of the aligner with the same reference index.
+/// Returning a new aligner is necessary for multithreaded alignment, as the
+/// underlying foreign aligner is not thread-safe.
+impl Clone for StarAligner {
+    fn clone(&self) -> Self {
+        Self {
+            index: self.index.clone(),
+            opts: self.opts.clone(),
+            inner: InnerAligner::new(self.index.as_ref()),
+        }
+    }
+}
+
+impl StarAligner {
+    /// Loads the genome index into memory.
+    ///
+    /// # Arguments
+    /// - `opts` - Options controlling alignment parameters.
+    ///
+    /// # Returns
+    /// - A `StarAligner` object initialized with the provided options.
+    pub fn new(opts: StarOpts) -> Result<Self> {
+        let index = StarIndex::load(&opts)?;
+        let inner = InnerAligner::new(&index);
+        Ok(Self {
+            index: Arc::new(index),
+            opts,
+            inner,
+        })
+    }
+
+    pub fn get_transcriptome(&self) -> Result<transcript::Transcriptome> {
+        transcript::Transcriptome::from_path(&self.opts.genome_dir)
+    }
+
+    /// Retrieves the header information.
+    ///
+    /// # Returns
+    /// - A reference to the alignment header.
+    pub fn get_header(&self) -> &Header {
+        &self.index.header
+    }
+
+    /// Aligns single-end reads.
+    pub fn align_read(&mut self, fq: &fastq::Record) -> Result<Vec<RecordBuf>> {
+        self.inner.align_read(&self.index.header, fq)
+    }
+
+    /// Aligns paired-end reads.
+    pub fn align_read_pair(
+        &mut self,
+        fq1: &fastq::Record,
+        fq2: &fastq::Record,
+    ) -> Result<(Vec<RecordBuf>, Vec<RecordBuf>)> {
+        self.inner.align_read_pair(&self.index.header, fq1, fq2)
+    }
+}
 
 /// Struct representing STAR aligner options.
 ///
@@ -199,69 +268,6 @@ impl Drop for InnerAligner {
     }
 }
 
-/// Main interface for performing read alignments using STAR.
-///
-/// `StarAligner` handles alignment of both single and paired-end reads to a reference genome.
-pub struct StarAligner {
-    index: Arc<StarIndex>,
-    opts: StarOpts,
-    inner: InnerAligner,
-}
-
-/// This will return a copy of the aligner with the same reference index.
-/// Returning a new aligner is necessary for multithreaded alignment, as the
-/// underlying foreign aligner is not thread-safe.
-impl Clone for StarAligner {
-    fn clone(&self) -> Self {
-        Self {
-            index: self.index.clone(),
-            opts: self.opts.clone(),
-            inner: InnerAligner::new(self.index.as_ref()),
-        }
-    }
-}
-
-impl StarAligner {
-    /// Loads the genome index into memory.
-    ///
-    /// # Arguments
-    /// - `opts` - Options controlling alignment parameters.
-    ///
-    /// # Returns
-    /// - A `StarAligner` object initialized with the provided options.
-    pub fn new(opts: StarOpts) -> Result<Self> {
-        let index = StarIndex::load(&opts)?;
-        let inner = InnerAligner::new(&index);
-        Ok(Self {
-            index: Arc::new(index),
-            opts,
-            inner,
-        })
-    }
-
-    /// Retrieves the header information.
-    ///
-    /// # Returns
-    /// - A reference to the alignment header.
-    pub fn get_header(&self) -> &Header {
-        &self.index.header
-    }
-
-    /// Aligns single-end reads.
-    pub fn align_read(&mut self, fq: &fastq::Record) -> Result<Vec<RecordBuf>> {
-        self.inner.align_read(&self.index.header, fq)
-    }
-
-    /// Aligns paired-end reads.
-    pub fn align_read_pair(
-        &mut self,
-        fq1: &fastq::Record,
-        fq2: &fastq::Record,
-    ) -> Result<(Vec<RecordBuf>, Vec<RecordBuf>)> {
-        self.inner.align_read_pair(&self.index.header, fq1, fq2)
-    }
-}
-
 fn parse_sam_to_records<'a>(
     aln_buf: &'a [u8],
     sam_buf: &'a mut Vec<u8>,
@@ -354,6 +360,8 @@ mod test {
         let opts = StarOpts::new(ERCC_REF);
         let aligner = StarAligner::new(opts).unwrap();
 
+        aligner.get_transcriptome().unwrap();
+
         let mut writer = sam::io::Writer::new(Vec::new());
         writer.write_header(&aligner.get_header()).unwrap();
         let header_string = String::from_utf8(writer.get_ref().clone()).unwrap();
@@ -380,23 +388,28 @@ mod test {
         let opts = StarOpts::new(ERCC_REF);
         let mut aligner = StarAligner::new(opts).unwrap();
 
+        let unmapped = make_fq(b"UM", b"ATCGATCGATCGATCG", b"????????????????");
         let fq1 = make_fq(b"ERCC1", ERCC_READ_1, ERCC_QUAL_1);
         let fq2 = make_fq(b"ERCC2", ERCC_READ_2, ERCC_QUAL_2);
         let fq3 = make_fq(b"ERCC3", ERCC_READ_3, ERCC_QUAL_3);
         let fq4 = make_fq(b"ERCC4", ERCC_READ_4, ERCC_QUAL_4);
+
+        let recs = aligner.align_read(&unmapped).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].flags().bits(), 0x4);
 
         let recs = aligner.align_read(&fq1).unwrap();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].name().unwrap(), "ERCC1");
         assert_eq!(recs[0].alignment_start().unwrap().get(), 51);
         assert_eq!(recs[0].reference_sequence_id().unwrap(), 0);
-        println!("{:?}", recs);
+        assert!(recs[0].mapping_quality().is_none());  // STAR assigns 255 to uniquely mapped reads 
 
         let recs = aligner.align_read(&fq2).unwrap();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].reference_sequence_id().unwrap(), 0);
         assert_eq!(recs[0].alignment_start().unwrap().get(), 501);
-        println!("{:?}", recs);
+        assert!(recs[0].mapping_quality().is_none());  // STAR assigns 255 to uniquely mapped reads 
 
         let recs = aligner.align_read(&fq3).unwrap();
         assert_eq!(recs.len(), 2);
@@ -408,10 +421,8 @@ mod test {
         assert_eq!(recs[1].reference_sequence_id().unwrap(), 72);
         assert_eq!(recs[1].alignment_start().unwrap().get(), 554);
         assert_eq!(recs[1].mapping_quality().unwrap().get(), 3);
-        println!("{:?}", recs);
 
         let recs = aligner.align_read(&fq4).unwrap();
-        println!("{:?}", recs);
         assert_eq!(recs.len(), 2);
         assert_eq!(recs[0].flags().bits(), 0);
         assert_eq!(recs[0].reference_sequence_id().unwrap(), 72);
@@ -421,6 +432,9 @@ mod test {
         assert_eq!(recs[1].reference_sequence_id().unwrap(), 72);
         assert_eq!(recs[1].alignment_start().unwrap().get(), 608);
         assert_eq!(recs[1].mapping_quality().unwrap().get(), 3);
+
+        let (recs1, recs2) = aligner.align_read_pair(&fq1, &fq2).unwrap();
+        assert_eq!((recs1.len(), recs2.len()), (1, 1));
     }
 
     #[test]
@@ -437,7 +451,6 @@ mod test {
         assert!(recs[0].reference_sequence_id().is_none());
         assert!(recs[0].alignment_start().is_none());
         assert_eq!(recs[0].mapping_quality().unwrap().get(), 0);
-        println!("{:?}", recs);
     }
 
     #[test]
