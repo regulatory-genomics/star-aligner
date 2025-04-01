@@ -496,4 +496,25 @@ mod test {
             .collect::<Vec<_>>();
         assert_eq!(res1, res2);
     }
+
+
+    #[test]
+    fn test_star() {
+        let mut fq_reader = File::open(ERCC_PARA300_PATH)
+            .map(GzDecoder::new)
+            .map(BufReader::new)
+            .map(fastq::io::Reader::new)
+            .unwrap();
+        let records: Vec<_> = fq_reader.records().map(Result::unwrap).collect();
+
+        let star_index = "/data/Public/STAR_reference/refdata-gex-GRCm39-2024-A/star_2.7.1";
+        let opts = StarOpts::new(star_index);
+        let mut aligner = StarAligner::new(opts).unwrap();
+
+        let res1 = records
+            .iter()
+            .map(|r| aligner.align_read(r).unwrap())
+            .collect::<Vec<_>>();
+        println!("{:?}", res1)
+    }
 }

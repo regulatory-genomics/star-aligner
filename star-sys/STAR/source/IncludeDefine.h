@@ -21,6 +21,7 @@
 #include <errno.h>
 #include <limits>
 #include <stdint.h>
+#include <memory>
 
 #include "VERSION"
 

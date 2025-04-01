@@ -9,7 +9,7 @@ license = "MIT"
 anyhow = "1"
 libc = "*"
 noodles = { version = "0.85", features = ["core", "gtf", "fastq", "bam", "sam"] }
-star-sys = { version = "0.2", workspace = true}
+star-sys = { workspace = true}
 indexmap = "2.6"
 
 [dev-dependencies]
