@@ -129,7 +129,11 @@ fn main() {
         .flag("-Wall")
         .flag("-Wextra")
         .flag("-Werror")
-        .flag("-fvisibility=hidden");
+        .flag("-fvisibility=hidden")
+        // These two lines were added as a workaround for the GCC 13+ build issue:
+        // https://github.com/pybind/pybind11/issues/5224 
+        .flag("-Wno-array-bounds")
+        .flag("-Wno-stringop-overflow");
 
     if cfg!(target_feature = "sse3") {
         build.flag("-msse3");
