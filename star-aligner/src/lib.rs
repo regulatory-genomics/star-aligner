@@ -130,16 +130,6 @@ impl StarOpts {
         self
     }
 
-    /// Enable MD tag output by setting attributes to "Standard MD".
-    /// This includes the standard attributes (NH HI AS nM) plus the MD tag.
-    ///
-    /// # Returns
-    /// - A modified `StarOpts` object with MD tag enabled.
-    pub fn with_md_tag(mut self) -> Self {
-        self.out_sam_attributes = "Standard MD".to_string();
-        self
-    }
-
     /// Converts options to a vector of C-style strings for FFI compatibility.
     ///
     /// # Returns
@@ -555,22 +545,6 @@ mod test {
             .map(|r| aligner.align_read(r).unwrap())
             .collect::<Vec<_>>();
         println!("{:?}", res1)
-    }
-
-    #[test]
-    fn test_md_tag_configuration() {
-        // Test with MD tag enabled
-        let opts_with_md = StarOpts::new(ERCC_REF).with_md_tag();
-        let mut aligner = StarAligner::new(opts_with_md).unwrap();
-
-        let fq = make_fq(NAME, ERCC_READ_1, ERCC_QUAL_1);
-        let recs = aligner.align_read(&fq).unwrap();
-
-        // The MD tag should be present in the alignment output
-        // Note: The actual MD tag content would be visible in the SAM output
-        // but is not directly accessible through the RecordBuf interface
-        assert_eq!(recs.len(), 1);
-        assert_eq!(recs[0].reference_sequence_id().unwrap(), 0);
     }
 
     #[test]
