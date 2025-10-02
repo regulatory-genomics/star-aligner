@@ -1,6 +1,6 @@
 [package]
 name = "star-aligner"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["Kai Zhang <zhangkai33@westlake.edu.cn>"]
 edition = "2021"
 license = "MIT"
@@ -8,13 +8,10 @@ license = "MIT"
 [dependencies]
 anyhow = "1"
 libc = "*"
-noodles = { version = "0.98", features = ["core", "gtf", "fastq", "bam", "sam"] }
+noodles = { version = "0.101", features = ["core", "gtf", "fastq", "bam", "sam"] }
 star-sys = { workspace = true}
-indexmap = "2.9"
+indexmap = "2.11"
 
 [dev-dependencies]
 flate2 = "1.0"
 rayon = "1.10.0"
-
-[profile.release]
-debug = 1
