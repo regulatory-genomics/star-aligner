@@ -193,9 +193,23 @@ impl Drop for StarIndex {
     }
 }
 
+/// STAR version this crate is linked against. Reported in error messages.
+const STAR_VERSION: &str = "2.7.2a";
+
+/// Required `versionGenome` value for indices loaded by this STAR release.
+/// Mirrors `versionGenome` in STAR's `parametersDefault` — the earliest index
+/// version this STAR release accepts.
+const REQUIRED_GENOME_VERSION: &str = "2.7.1a";
+
+/// Legacy `versionGenome` literal that STAR also treats as compatible.
+/// See the special case in `Genome.cpp`.
+const LEGACY_GENOME_VERSION: &str = "20201";
+
 impl StarIndex {
     /// Load a reference index into memory based on the given settings.
     fn load(opts: &StarOpts) -> Result<Self> {
+        check_genome_version(opts.genome_dir.as_path())?;
+
         let header = generate_header(opts.genome_dir.as_path())?;
 
         let c_args = opts.to_c_args();
@@ -204,6 +218,50 @@ impl StarIndex {
         let index = unsafe { star_sys::init_star_ref(length, c_args.as_ptr()) };
         Ok(StarIndex { index, header })
     }
+}
+
+/// Reads `versionGenome` from `<genome_dir>/genomeParameters.txt` and rejects
+/// indices that STAR itself would reject. Mirrors the rule in
+/// `star-sys/STAR/source/Genome.cpp`: the value must equal either
+/// `REQUIRED_GENOME_VERSION` or the legacy `LEGACY_GENOME_VERSION` literal.
+/// Returning a `Result` here keeps the failure recoverable — without it, STAR
+/// calls `exit()` from inside the FFI and tears down the host process.
+fn check_genome_version(genome_dir: &Path) -> Result<()> {
+    let path = genome_dir.join("genomeParameters.txt");
+    let file = File::open(&path)
+        .map_err(|e| anyhow::anyhow!("failed to open {}: {}", path.display(), e))?;
+
+    let mut index_version: Option<String> = None;
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        let mut parts = line.split_whitespace();
+        if parts.next() == Some("versionGenome") {
+            index_version = parts.next().map(|s| s.to_string());
+            break;
+        }
+    }
+
+    let Some(index_version) = index_version else {
+        bail!(
+            "read no value for the versionGenome parameter from {}\n\
+             SOLUTION: please re-generate genome with running version {} of STAR, or with version: {}",
+            path.display(),
+            STAR_VERSION,
+            REQUIRED_GENOME_VERSION,
+        );
+    };
+
+    if index_version == REQUIRED_GENOME_VERSION || index_version == LEGACY_GENOME_VERSION {
+        return Ok(());
+    }
+
+    bail!(
+        "Genome version: {} is INCOMPATIBLE with running STAR version: {}\n\
+         SOLUTION: please re-generate genome from scratch with running version of STAR, or with version: {}",
+        index_version,
+        STAR_VERSION,
+        REQUIRED_GENOME_VERSION,
+    );
 }
 
 /// A wrapper around the STAR aligner. This is solely used to ensure that the
